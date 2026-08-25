@@ -225,31 +225,29 @@ jobs:
     # GitHub rejects the entire workflow file with "Unrecognized named-value: 'secrets'".
     continue-on-error: true
     runs-on: ubuntu-latest
+    # Declared ONCE at job level. Setting it per-step collided with the env: these steps already had
+    # ("'env' is already defined"), which rejects the whole file — and a job-level env is visible to
+    # every step's `if:`, which is what the gate needs.
+    env:
+      FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
     steps:
       - uses: actions/checkout@v7
       - name: run fossa anlyze and create report
         if: ${{ env.FOSSA_API_KEY != '' }}
-        env:
-          FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
         run: |
           curl -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/fossas/fossa-cli/master/install-latest.sh | bash
           fossa analyze  --include-unused-deps --debug
           fossa report attribution --format text > /tmp/THIRDPARTY
-        env:
-          FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
       - name: upload THIRDPARTY file
         uses: actions/upload-artifact@v7
+        if: ${{ env.FOSSA_API_KEY != '' }}
         with:
           name: THIRDPARTY
           path: /tmp/THIRDPARTY
       - name: run fossa test
         if: ${{ env.FOSSA_API_KEY != '' }}
-        env:
-          FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
         run: |
           fossa test --debug
-        env:
-          FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
   semgrep:
     runs-on: ubuntu-latest
     name: security-sast-semgrep
