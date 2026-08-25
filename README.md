@@ -1,5 +1,3 @@
----
-
 > **ADOPTED FORK — actively maintained.** Upstream `splunk/fluent-plugin-kubernetes-objects` was archived on
 > 2025-06-24 and its Docker Hub image was deleted, which breaks every existing install on its next
 > image pull. This fork was adopted to keep the connector deployable and to fix the bugs that had
