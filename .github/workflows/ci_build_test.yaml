@@ -77,6 +77,13 @@ jobs:
     needs:
       - unit-test
     runs-on: ubuntu-latest
+    # BACKSTOP. Every wait below is individually bounded, but deploy_connector.sh waits for the pod
+    # count in an unbounded loop — if an image can never be pulled, the job would otherwise sit at
+    # GitHub's 6-hour default before anyone noticed. A healthy run of this shape takes ~15 minutes,
+    # so an hour is generous without being open-ended. (ONE key only: two commits each added their
+    # own timeout-minutes and the duplicate made the whole workflow file invalid — Actions refuses
+    # to parse it, so nothing runs at all.)
+    timeout-minutes: 60
     env:
       CI_SPLUNK_PORT: 8089
       CI_SPLUNK_USERNAME: admin
@@ -85,8 +92,18 @@ jobs:
       CI_INDEX_EVENTS: ci_events
       CI_INDEX_OBJECTS: ci_objects
       CI_INDEX_METRICS: ci_metrics
-      KUBERNETES_VERSION: v1.23.2
-      MINIKUBE_VERSION: latest
+      # minikube v1.38.1 refuses anything below v1.28.0 ("Exiting due to K8S_OLD_UNSUPPORTED",
+      # exit 106), so upstream's v1.23.2 can no longer start at all. v1.34 is the newest
+      # upstream-supported minor that is still at or below minikube's newest-TESTED version
+      # (v1.35.1) — no floor error, no "newer than newest supported" warning, and no --force,
+      # which would poison exactly the signal this test exists to produce. This variable also
+      # pins the kubectl download below.
+      KUBERNETES_VERSION: v1.34.11
+      # Pinned, not `latest`: a new minikube release can move the supported-Kubernetes floor
+      # (exactly how v1.23.2 died), turning this job red with nothing in the repo changed.
+      # These two versions are a pair — bump them together, keeping KUBERNETES_VERSION inside
+      # the pinned minikube's window.
+      MINIKUBE_VERSION: v1.38.1
       MINIKUBE_NODE_COUNTS: 1
       GITHUB_ACTIONS: true
 
@@ -129,8 +146,10 @@ jobs:
 
       - name: Setup Minikube
         run: |
-          # Install Kubectl
-          curl -Lo kubectl https://storage.googleapis.com/kubernetes-release/release/${KUBERNETES_VERSION}/bin/linux/amd64/kubectl
+          # Install Kubectl. dl.k8s.io is the canonical host; the old kubernetes-release GCS
+          # bucket was frozen and never received the newer releases. -f makes an HTTP error fail
+          # the step instead of saving an error page as the "binary".
+          curl -fsSLo kubectl https://dl.k8s.io/release/${KUBERNETES_VERSION}/bin/linux/amd64/kubectl
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
           mkdir -p ${HOME}/.kube
@@ -142,28 +161,66 @@ jobs:
           # Start Minikube and Wait
           minikube start --driver=docker --container-runtime=docker --cpus 2 --memory 4096 --kubernetes-version=${KUBERNETES_VERSION} --no-vtx-check -n=${MINIKUBE_NODE_COUNTS}
           export JSONPATH='{range .items[*]}{@.metadata.name}:{range @.status.conditions[*]}{@.type}={@.status};{end}{end}'
+          # BOUNDED. `until ...; do sleep 1; done` with no ceiling is how this job hung for 18 minutes
+          # with no output and would have run to the 6-hour limit.
+          deadline=$(( $(date +%s) + 300 ))
           until kubectl get nodes -o jsonpath="$JSONPATH" 2>&1 | grep -q "Ready=True"; do
-            sleep 1;
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::no node reached Ready within 300s"
+              kubectl get nodes -o wide || true
+              kubectl describe nodes | tail -40 || true
+              exit 1
+            fi
+            sleep 2
           done
 
       - name: Install Splunk
         run: |
           # Wait until minikube is ready
           export JSONPATH='{range .items[*]}{@.metadata.name}:{range @.status.conditions[*]}{@.type}={@.status};{end}{end}'
+          deadline=$(( $(date +%s) + 300 ))
           until kubectl get nodes -o jsonpath="$JSONPATH" 2>&1 | grep -q "Ready=True"; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::no node reached Ready within 300s"
+              kubectl get nodes -o wide || true
+              exit 1
+            fi
             echo "wait for minikube ready ..."
-            sleep 1;
+            sleep 2
           done
           kubectl get nodes
+          deadline=$(( $(date +%s) + 120 ))
           until kubectl get sa | grep -q 'default'; do
-            sleep 1;
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::default ServiceAccount never appeared within 120s"
+              kubectl get sa -A || true
+              exit 1
+            fi
+            sleep 2
           done
           # Install Splunk on minikube
           kubectl apply -f ci_scripts/k8s-splunk.yml
           # Wait until splunk is ready
-          until kubectl logs splunk --tail=2 | grep -q 'Ansible playbook complete'; do
-            sleep 1;
+          # THIS IS THE LOOP THAT HUNG. The splunk pod sat in ContainerCreating and the loop polled
+          # it every second, forever, printing only "Error from server (BadRequest): container splunk
+          # is waiting to start" — which is the LOOP's error, not a diagnosis. Splunk pulls a ~2 GB
+          # image and then runs an Ansible playbook, so 10 minutes is generous but finite; on timeout
+          # dump what actually went wrong instead of leaving someone to guess.
+          deadline=$(( $(date +%s) + 600 ))
+          until kubectl logs splunk --tail=2 2>/dev/null | grep -q 'Ansible playbook complete'; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::splunk did not finish its Ansible playbook within 600s"
+              echo "--- pod ---";      kubectl get pod splunk -o wide || true
+              echo "--- describe ---"; kubectl describe pod splunk | tail -50 || true
+              echo "--- events ---";   kubectl get events --sort-by=.lastTimestamp | tail -30 || true
+              echo "--- logs ---";     kubectl logs splunk --tail=80 || true
+              echo "--- nodes ---";    kubectl top nodes 2>/dev/null || kubectl get nodes -o wide || true
+              exit 1
+            fi
+            printf '.'
+            sleep 5
           done
+          echo
           export CI_SPLUNK_HOST=$(kubectl get pod splunk --template={{.status.podIP}})
           # Setup Indexes
           curl -k -u $CI_SPLUNK_USERNAME:$CI_SPLUNK_PASSWORD https://$CI_SPLUNK_HOST:$CI_SPLUNK_PORT/services/data/indexes -d name=$CI_INDEX_EVENTS -d datatype=event
@@ -192,9 +249,11 @@ jobs:
           kubectl apply -f test/test_setup.yaml
           sleep 60
 
+      # 3.7 has no build for ubuntu-24.04 in actions/python-versions (its manifest stops at
+      # 22.04), so requesting it on ubuntu-latest fails before pip ever runs.
       - uses: actions/setup-python@v5
         with:
-          python-version: 3.7
+          python-version: '3.12'
 
       - name: Run functional tests
         run: |
