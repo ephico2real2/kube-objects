@@ -31,9 +31,9 @@ on:
         # feat/jq-free). Adding jq + a minimal shell to the same upstream version is a second
         # hardening pass, so the jq-capable default publishes as plain h2 — no variant suffix on
         # the default image — and can never overwrite the h1 tags. Bump to h3 when re-hardening.
-        description: 'Hardening pass — h2 is the jq-capable default; h1 is the frozen shell-less pass'
+        description: 'Hardening pass — h3 is the current default (h2 + relocked gems); h1/h2 frozen'
         required: true
-        default: 'h2'
+        default: 'h3'
       push:
         # DEFAULT TRUE by operator decision: a dispatch publishes. The scan gate
         # (fail_on_critical, below) still blocks a push on fixable CRITICAL/HIGH findings, so a
