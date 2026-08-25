@@ -27,12 +27,13 @@ on:
   workflow_dispatch:
     inputs:
       hardening_pass:
-        # 'h1-jq' BY DEFAULT ON THIS REPO: develop's images carry jq + a minimal shell (the
-        # feat/jq-capable merge), so a default dispatch must produce the -h1-jq tag family and can
-        # never overwrite the shell-less h1 tags, which are preserved from the feat/jq-free branch.
-        description: 'Hardening pass — h1-jq is the jq-capable develop default; bump to h2-jq when re-hardening'
+        # 'h2' BY DEFAULT ON THIS REPO. h1 was the shell-less pass (frozen as published; source on
+        # feat/jq-free). Adding jq + a minimal shell to the same upstream version is a second
+        # hardening pass, so the jq-capable default publishes as plain h2 — no variant suffix on
+        # the default image — and can never overwrite the h1 tags. Bump to h3 when re-hardening.
+        description: 'Hardening pass — h2 is the jq-capable default; h1 is the frozen shell-less pass'
         required: true
-        default: 'h1-jq'
+        default: 'h2'
       push:
         # DEFAULT TRUE by operator decision: a dispatch publishes. The scan gate
         # (fail_on_critical, below) still blocks a push on fixable CRITICAL/HIGH findings, so a
