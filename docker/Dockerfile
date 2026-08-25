@@ -99,6 +99,19 @@ RUN bundle exec fluentd --version
 RUN mkdir -p /fluentd/log /fluentd/etc /fluentd/plugins \
  && chmod -R g+rwX /fluentd
 
+# JQ PACK (feat/jq-capable branch). Assembles the minimal file set that makes the runtime able to
+# execute the chart's jq_transformer filters and users' raw-jq customFilters: fluent-plugin-jq
+# launches the external jq BINARY through a SHELL (IO.popen "jq ... 2>&1"), so it needs both
+# /bin/sh and jq. Contents measured with ldd, not guessed: jq + libjq.so.1 + libonig.so.5, and
+# bash + libtinfo.so.6 with an sh -> bash symlink (cp -L dereferences the library symlinks; the
+# sh symlink itself survives the directory COPY below).
+RUN dnf install -y jq && dnf clean all \
+ && mkdir -p /jqpack/bin /jqpack/lib64 \
+ && cp -L /usr/bin/jq /usr/bin/bash /jqpack/bin/ \
+ && ln -s bash /jqpack/bin/sh \
+ && cp -L /usr/lib64/libjq.so.1 /usr/lib64/libonig.so.5 /usr/lib64/libtinfo.so.6 /jqpack/lib64/ \
+ && /jqpack/bin/jq --version
+
 # ----------------------------------------------------------------------------
 # Stage 3 — runtime. NO SHELL EXISTS IN THIS IMAGE: no RUN can appear below,
 # only metadata and COPY. The base already runs as uid 65532 (gid 0), sets
@@ -127,6 +140,14 @@ COPY --from=appbuild --chown=65532:0 /usr/local/bundle /usr/local/bundle
 # Gemfile + Gemfile.lock + the unpacked plugin (gem/) + the log/etc/plugins directories the chart
 # mounts into and writes under, pre-created and group-writable because there is no mkdir here.
 COPY --from=appbuild --chown=65532:0 /fluentd /fluentd
+
+# JQ-CAPABLE VARIANT — a deliberate, mandated deviation from the shell-less default, for users
+# whose customFilters need raw jq: this restores /bin/sh (bash) and jq to the runtime. The cost is
+# real — a shell returns to the attack surface — and accepted for this variant only; the default
+# images on develop stay shell-less. /bin is a symlink to /usr/bin in this base, so the COPY lands
+# the binaries on PATH and /bin/sh resolves through the symlink.
+COPY --from=appbuild /jqpack/bin/ /bin/
+COPY --from=appbuild /jqpack/lib64/ /usr/lib64/
 
 # Belt and braces: WORKDIR alone would let bundler find the Gemfile by cwd, but a pod spec that
 # overrides workingDir would silently break that. The explicit path cannot be broken by cwd.
