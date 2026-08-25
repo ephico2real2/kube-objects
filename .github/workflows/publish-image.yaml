@@ -11,6 +11,12 @@
 # upstream's retired runners (ubuntu-20.04), deprecated actions (checkout@v2, cache@v1) or the
 # `::set-output` syntax GitHub removed.
 #
+# ACTION VERSIONS ARE KEPT ON THE CURRENT MAJORS, and that is maintenance, not tidiness. GitHub is
+# retiring Node 20 on its runners, so anything still on a node20 action emits a deprecation warning now
+# and stops working later; every action pinned below runs on node24. codeql-action v3 additionally
+# carries its own December 2026 deprecation. When a warning appears in a run, bump the major here and
+# redistribute — do not silence it with ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION.
+#
 # WHY MANUAL BY DEFAULT. These four images carry production telemetry to Splunk. Publishing on every push
 # would let an unreviewed commit reach a cluster that pulls a rolling tag. Releases here are deliberate
 # acts, so the trigger is workflow_dispatch plus an explicit `image-v*` tag.
@@ -57,7 +63,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # The image name matches the repository name for all four (fluentd-hec, kube-objects, k8s-metrics,
       # k8s-metrics-aggr), so one workflow serves every repo without per-repo configuration.
@@ -115,7 +121,7 @@ jobs:
           echo "- rolling:   \`${REPO}:${VERSION}-${PASS}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # BUILD FIRST, PUSH LATER — the two are deliberately separate steps.
       #
@@ -128,7 +134,7 @@ jobs:
       # LABELs and into ENV VERSION, so `docker inspect` on a running container reports the same identity
       # as its tag. Without it the labels say "null" and a running pod cannot be traced back to a build.
       - name: Build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./docker/Dockerfile
@@ -172,7 +178,7 @@ jobs:
 
       - name: Upload scan report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: trivy-${{ steps.id.outputs.image }}-${{ steps.id.outputs.version }}
           path: trivy-report.json
@@ -187,6 +193,14 @@ jobs:
       # block on things a rebuild can act on, or it would be unpassable. The Security tab has the
       # opposite job: record everything, so an unfixable finding that LATER gets a fix is visible the
       # next time this runs rather than silently missed.
+      #
+      # CRITICAL,HIGH ONLY — MEDIUM IS EXCLUDED BECAUSE IT BROKE THIS. The first version sent
+      # CRITICAL,HIGH,MEDIUM and the upload came back with results_count exactly 5000, which is
+      # GitHub's per-upload SARIF ceiling, not a coincidence: the UBI base alone carries ~3700 MEDIUM
+      # findings. So the upload was SILENTLY TRUNCATED at the cap, and what survived was mostly
+      # unfixable MEDIUM vim CVEs — burying the CRITICAL and HIGH entries this exists to surface, and
+      # making the first-seen/fixed history meaningless because the set is arbitrary. CRITICAL+HIGH is
+      # ~220 for the base: comfortably under the cap, and every entry is worth a human look.
       - name: Scan (SARIF for the Security tab)
         if: always()
         uses: aquasecurity/trivy-action@v0.36.0
@@ -194,13 +208,13 @@ jobs:
           image-ref: ${{ steps.id.outputs.immutable }}
           format: sarif
           output: trivy-results.sarif
-          severity: CRITICAL,HIGH,MEDIUM
+          severity: CRITICAL,HIGH
           scanners: vuln
           exit-code: '0'
 
       - name: Publish SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
           category: trivy-image
@@ -212,7 +226,7 @@ jobs:
       # revocable without changing the password, and it does not unlock the Hub web account.
       - name: Log in to Docker Hub
         if: ${{ inputs.push == true || github.event_name == 'push' }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.DOCKERHUB_USERNAME }}
