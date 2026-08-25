@@ -34,10 +34,13 @@ on:
         required: true
         default: 'h1-jq'
       push:
-        description: 'Actually push to Docker Hub. Leave false to build and scan only.'
+        # DEFAULT TRUE by operator decision: a dispatch publishes. The scan gate
+        # (fail_on_critical, below) still blocks a push on fixable CRITICAL/HIGH findings, so a
+        # default dispatch remains safe; set push=false explicitly for a build-and-scan-only run.
+        description: 'Push to the registries (default). Set false to build and scan only.'
         type: boolean
         required: true
-        default: false
+        default: true
       fail_on_critical:
         description: 'Refuse to push if trivy finds a fixable CRITICAL or HIGH.'
         type: boolean
