@@ -27,9 +27,12 @@ on:
   workflow_dispatch:
     inputs:
       hardening_pass:
-        description: 'Hardening pass number — bump when re-hardening the same upstream version (h1, h2, ...)'
+        # 'h1-jq' BY DEFAULT ON THIS REPO: develop's images carry jq + a minimal shell (the
+        # feat/jq-capable merge), so a default dispatch must produce the -h1-jq tag family and can
+        # never overwrite the shell-less h1 tags, which are preserved from the feat/jq-free branch.
+        description: 'Hardening pass — h1-jq is the jq-capable develop default; bump to h2-jq when re-hardening'
         required: true
-        default: 'h1'
+        default: 'h1-jq'
       push:
         description: 'Actually push to Docker Hub. Leave false to build and scan only.'
         type: boolean
