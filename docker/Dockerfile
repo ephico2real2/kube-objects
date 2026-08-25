@@ -1,14 +1,109 @@
-FROM ruby:3.3-bookworm AS builder
+# =============================================================================
+# THREE STAGES, AND THE SPLIT IS LOAD-BEARING.
+#
+# The runtime base (hi/ruby:3.4) is a Red Hat Hardened Image with NO SHELL AT ALL — /bin/sh does not
+# exist, so a RUN instruction in the final stage cannot execute in any form. Everything that used to
+# happen there (gem install, bundle install, dnf, mkdir, chown) now happens in builder stages and
+# crosses into the runtime as files, via COPY --from.
+#
+# Two SEPARATE builder stages, not one, because they install different gem trees into the same
+# GEM_HOME (/usr/local/bundle — both hardened images pin it there). gembuild resolves the repo-root
+# Gemfile, which drags in development/test gems that must never ship; appbuild resolves only
+# docker/Gemfile, and its /usr/local/bundle is the one the runtime copies. One shared stage would
+# ship the union.
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# Stage 1 — gembuild: package the plugin source into a .gem, exactly as
+# `bundle exec rake build` has always done. Nothing from this stage ships
+# except the .gem file itself.
+FROM registry.access.redhat.com/hi/ruby:3.4-builder AS gembuild
+
+# The hardened builder's default user is 65532; dnf and writing /app need root. Root never survives
+# into the runtime image — the final stage runs as 65532 (the base's own user).
+USER 0
+
+# NO `dnf update -y` HERE, DELIBERATELY. On the old ubi9 base that line patched packages that
+# SHIPPED (measured: it was worth 129 fixable HIGHs there). On this base nothing a builder-stage dnf
+# touches can reach the runtime — only the gem tree crosses, via COPY --from — so updating builder
+# RPMs changes the shipped artifact by exactly nothing and costs build-time reproducibility. If it is
+# ever reinstated: plain `dnf update -y` FAILS on this builder (measured 2026-08-24 — the repo's best
+# candidate for redhat-rpm-config requires gnome-srpm-macros, which the public hummingbird repo does
+# not provide), so it would need --no-best; and measured the same day, --no-best had nothing to do.
+
+# HEADERS THE LOCKED GEMS COMPILE AGAINST, measured, not guessed. The hardened builder ships gcc and
+# make but not these -devel packages: without openssl-devel the openssl gem (4.0.2, pulled in via
+# fluentd -> async-http -> io-endpoint) dies in extconf with "OpenSSL library could not be found";
+# libffi-devel makes the ffi gem link the system libffi.so.8 — which the hardened RUNTIME ships —
+# instead of statically building its vendored copy. git-core because THIS repo's root Gemfile
+# git-sources kubeclient (github.com/ephico2real2/kubeclient, pinned ref) and the hardened builder
+# ships no git. Builder-only: no package installed here ships.
+RUN dnf install -y git-core openssl-devel libffi-devel && dnf clean all
 
 ADD ./ /app/
 WORKDIR /app
-RUN gem install bundler
+
+# PIN BUNDLER TO THE 2.x SERIES. The gemspec declares `bundler ~> 2.0`; a bare `gem install bundler`
+# now fetches 4.x, and once that is first on PATH the resolve fails blaming the Gemfile. Same
+# rationale, at more length, in ci_scripts/relock.sh.
+RUN gem install bundler -v '~> 2.0' --no-document
 RUN bundle update --bundler
 RUN bundle install
-
 RUN bundle exec rake build -t -v
 
-FROM registry.access.redhat.com/ubi9/ruby-33
+# ----------------------------------------------------------------------------
+# Stage 2 — appbuild: assemble every file the runtime will contain, at the
+# exact paths the runtime will use. /usr/local/bundle here IS the runtime gem
+# tree; /fluentd here IS the runtime app directory.
+FROM registry.access.redhat.com/hi/ruby:3.4-builder AS appbuild
+
+USER 0
+
+# The hardened builder ships NO git, and docker/Gemfile sources kubeclient from a git repository
+# (github.com/ephico2real2/kubeclient, pinned to a ref), so `bundle install` below needs a git
+# binary. openssl-devel and libffi-devel for the same measured reasons as in gembuild — this stage
+# compiles the tree that actually ships. Builder-only: nothing dnf installs here can reach the
+# runtime, because only /usr/local/bundle and /fluentd are copied out.
+RUN dnf install -y git-core openssl-devel libffi-devel && dnf clean all
+
+COPY docker/Gemfile docker/Gemfile.lock /fluentd/
+COPY --from=gembuild /app/pkg/fluent-plugin-*.gem /tmp/
+
+WORKDIR /fluentd
+
+# GEM_HOME IS ALREADY CORRECT, AND THAT IS THE POINT OF THIS BASE PAIR. Both hardened images set
+# GEM_HOME=/usr/local/bundle and BUNDLE_APP_CONFIG=/usr/local/bundle with BUNDLE_PATH unset, so the
+# tree `bundle install` writes here is found by the runtime with no ENV wrangling. On ubi9 that
+# alignment had to be built by hand, and getting it wrong shipped an image that scanned clean and
+# could not boot ("bundler: command not found: fluentd" — the gems existed, just not where the
+# runtime user looked).
+#
+# ESSENTIAL STEPS, IN THEIR OWN RUN, WITH NO `|| true`. An earlier &&-chain ending in `|| true`
+# short-circuited before `bundle install` and reported success — an image with no application in it,
+# which no vulnerability scan can see. If any step here fails, the build fails.
+RUN gem install bundler -v '~> 2.0' --no-document \
+ && gem unpack /tmp/*.gem --target gem \
+ && bundle install \
+ && rm -f /tmp/*.gem
+
+# PROVE THE GEM TREE CAN RUN, AT BUILD TIME. This exercises the same resolution path the runtime CMD
+# uses (same GEM_HOME, same Gemfile, same cwd), so a broken install fails the build instead of
+# shipping. The runtime image repeats this proof from the outside — docker run <image> — because this
+# stage's ruby is the builder's, not the runtime's.
+RUN bundle exec fluentd --version
+
+# The runtime cannot mkdir or chmod, so the writable directories the chart expects are created here
+# and copied across. g+rwX because the runtime user is uid 65532 gid 0 — group-0 write also keeps
+# OpenShift-style arbitrary-uid execution working. Ownership is stamped at COPY time in the runtime
+# stage (--chown), not here.
+RUN mkdir -p /fluentd/log /fluentd/etc /fluentd/plugins \
+ && chmod -R g+rwX /fluentd
+
+# ----------------------------------------------------------------------------
+# Stage 3 — runtime. NO SHELL EXISTS IN THIS IMAGE: no RUN can appear below,
+# only metadata and COPY. The base already runs as uid 65532 (gid 0), sets
+# GEM_HOME=/usr/local/bundle, and puts /usr/local/bundle/bin first on PATH.
+FROM registry.access.redhat.com/hi/ruby:3.4
 
 ARG VERSION
 
@@ -21,85 +116,29 @@ LABEL name="Splunk Connect for Kubernetes Objects container" \
       description="Splunk Connect for Kubernetes Objects container"
 
 ENV VERSION=${VERSION}
-ENV FLUENT_USER=fluent
 
-# GEM_HOME AND BUNDLE_PATH MUST BE PINNED, or the image builds clean, scans clean, and cannot boot.
-#
-# The UBI Ruby images do not set GEM_HOME, so Gem.dir is derived per-user. Measured in this image:
-#     as root    Gem.dir=/usr/local/share/gems
-#     as fluent  Gem.dir=/opt/app-root/src/.local/share/gem/ruby
-# `bundle install` below runs as root; CMD runs as $FLUENT_USER. Without a pinned GEM_HOME the two
-# resolve different directories and the container dies with:
-#     bundler: command not found: fluentd
-#     Install missing gem executables with `bundle install`
-# Nothing in a vulnerability scan catches this — the gems are present, just not where the runtime user
-# looks.
-#
-# BUNDLE_PATH IS DELIBERATELY NOT SET. Setting it alongside GEM_HOME is what broke the first attempt:
-# bundler then installs application-locked binstubs to its own path while RubyGems resolves against
-# GEM_HOME, and the two disagree. RubyGems' own Docker guide is explicit that BUNDLE_PATH and
-# BUNDLE_BIN should be left unset so GEM_HOME takes precedence:
-#   https://guides.rubygems.org/bundler_docker_guide
-# PATH carries BOTH ${GEM_HOME}/bin and ${GEM_HOME}/gems/bin, per that guide — the second is where
-# gem-provided executables land, and omitting it is another way to get 'command not found'.
-ENV GEM_HOME=/usr/local/bundle
-ENV BUNDLE_APP_CONFIG=/usr/local/bundle
-ENV PATH=/usr/local/bundle/bin:/usr/local/bundle/gems/bin:$PATH
+COPY LICENSE /licenses/LICENSE
 
-USER root
+# The whole gem tree, installed by appbuild into the exact GEM_HOME this base declares. --chown to
+# the runtime identity rather than trusting source-stage ownership — uid 65532 has no passwd entry,
+# so it is written numerically.
+COPY --from=appbuild --chown=65532:0 /usr/local/bundle /usr/local/bundle
 
-COPY --from=builder /app/pkg/fluent-plugin-*.gem /tmp/
+# Gemfile + Gemfile.lock + the unpacked plugin (gem/) + the log/etc/plugins directories the chart
+# mounts into and writes under, pre-created and group-writable because there is no mkdir here.
+COPY --from=appbuild --chown=65532:0 /fluentd /fluentd
 
-RUN mkdir /licenses
-COPY --from=builder /app/LICENSE /licenses/LICENSE
+# Belt and braces: WORKDIR alone would let bundler find the Gemfile by cwd, but a pod spec that
+# overrides workingDir would silently break that. The explicit path cannot be broken by cwd.
+ENV BUNDLE_GEMFILE=/fluentd/Gemfile
+WORKDIR /fluentd
 
-RUN dnf install -y jq
+# The base already defaults to 65532; restated so the security posture is declared in THIS file and
+# survives a base-image change.
+USER 65532
 
-COPY --from=builder /app/docker/Gemfile* ./
-
-# ESSENTIAL STEPS, IN THEIR OWN RUN, WITH NO `|| true`. This was one long &&-chain ending in `|| true`,
-# and that shape caused a shipped image that scanned clean and could not boot: pinning GEM_HOME moved
-# bundler out of /usr/share/gems, so `gem uninstall -i /usr/share/gems bundler` failed with
-# Gem::FilePermissionError, the && chain short-circuited, `bundle install` NEVER RAN, and `|| true`
-# reported the whole thing as success. A vulnerability scan cannot see that — the image is simply
-# missing its application.
-#
-# The `gem install bundler` / `gem uninstall bundler` dance from the original is gone with it: it
-# existed to swap the system bundler, which a pinned GEM_HOME makes unnecessary.
-RUN dnf update -y \
- && dnf clean all \
- && gem install bundler -v '~> 2.0' --no-document \
- && gem unpack /tmp/*.gem --target gem \
- && bundle install
-
-# PROVE THE IMAGE CAN RUN, AT BUILD TIME. One line, and it is the difference between finding a broken
-# image here and finding it in a cluster. `bundle exec fluentd --version` exercises the same resolution
-# path the CMD uses, so a GEM_HOME/BUNDLE_PATH mismatch fails the build instead of shipping.
-RUN bundle exec fluentd --version
-
-# ATTACK-SURFACE REDUCTION, deliberately separate and deliberately NOT `rpm -e --nodeps ... || true`.
-# Force-removing ~25 packages with --nodeps leaves a broken dependency graph and lowers a scanner count
-# without lowering risk; swallowing the result with `|| true` means it silently does nothing when it
-# breaks. These are removed by name, through dnf so dependencies are respected, and the step is allowed
-# to fail the build if it cannot do so cleanly. Each one is here because nothing in a fluentd image
-# needs it: no compilation at runtime, no source checkouts, no remote shells.
-RUN dnf remove -y nodejs npm git binutils openshift-clients openssh-clients \
- && dnf clean all \
- && rm -rf /var/cache/dnf /tmp/*.gem
-
-RUN mkdir -p ${GEM_HOME} && chmod -R a+rX ${GEM_HOME}
-
-RUN groupadd -r $FLUENT_USER && \
-  useradd -r -g $FLUENT_USER $FLUENT_USER && \
-  mkdir -p /fluentd/log fluentd/etc /fluentd/plugins &&\
-  chown -R $FLUENT_USER /fluentd && chgrp -R $FLUENT_USER /fluentd && \
-  chmod +t /tmp
-
-USER $FLUENT_USER
-# EXEC FORM, NOT SHELL FORM. With `CMD bundle exec ...` docker runs it via /bin/sh -c, so PID 1
-# is the shell and fluentd is its child. The shell does not forward signals, so a Kubernetes
-# SIGTERM on pod deletion never reaches fluentd: it is not flushed, in-flight events are lost,
-# and the kubelet SIGKILLs it after the grace period. Exec form makes fluentd PID 1 and gives it
-# the signal directly. This also silences docker's JSONArgsRecommended warning, but the reason
-# to do it is the lost telemetry, not the warning.
+# EXEC FORM, NOT SHELL FORM — doubly mandatory now. With `CMD bundle exec ...` docker would run
+# /bin/sh -c, and this image HAS no /bin/sh, so the container could not start at all. It was already
+# the right form before that: exec form makes fluentd PID 1, so a Kubernetes SIGTERM on pod deletion
+# reaches fluentd directly and in-flight events are flushed instead of lost to the kubelet's SIGKILL.
 CMD ["bundle", "exec", "fluentd", "-c", "/fluentd/etc/fluent.conf"]
