@@ -50,6 +50,8 @@ env:
   # produces a plausible-looking reference that fails only at pull time, on a cluster.
   REGISTRY: docker.io
   DOCKERHUB_NAMESPACE: ephico2real
+  QUAY_REGISTRY: quay.io
+  QUAY_NAMESPACE: ephico2real
   PLATFORM: linux/amd64
 
 jobs:
@@ -234,35 +236,76 @@ jobs:
           sarif_file: trivy-results.sarif
           category: trivy-image
 
-      # Login happens LAST-MINUTE, after the scan has passed. Credentials are never in the environment
-      # during the build, so a malicious or compromised dependency in the image build cannot read them.
+      # SKOPEO, NOT `docker push`, AND THE CREDENTIALS ARRIVE LAST.
       #
-      # DOCKERHUB_TOKEN must be a Docker Hub ACCESS TOKEN, not the account password: it is scoped, it is
-      # revocable without changing the password, and it does not unlock the Hub web account.
-      - name: Log in to Docker Hub
+      # Nothing is logged in until the scan above has passed, so registry credentials are never in the
+      # environment while an untrusted dependency tree is being built. skopeo takes them per-invocation
+      # via --dest-creds rather than writing a config file, which keeps that property.
+      #
+      # WHY skopeo RATHER THAN docker push. The first copy moves the image out of the local daemon; the
+      # second is REGISTRY-TO-REGISTRY, so quay pulls the blobs from Docker Hub directly instead of the
+      # runner re-uploading a 1.1 GB image a second time. It also copies the manifest verbatim, so both
+      # registries hold the SAME DIGEST — a cluster pulling from quay and one pulling from Docker Hub
+      # are provably running identical bytes, which a second `docker push` cannot promise.
+      #
+      # skopeo is preinstalled on ubuntu-latest.
+      - name: Push to Docker Hub
         if: ${{ inputs.push == true || github.event_name == 'push' }}
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # Both tags are the same digest — the immutable one is what a cluster pins, the rolling one is for
-      # humans. There is deliberately NO `latest`: a moving latest on a telemetry image is how a cluster
-      # silently changes behaviour on a pod reschedule.
-      - name: Push
-        if: ${{ inputs.push == true || github.event_name == 'push' }}
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_PASS: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
-          docker push "${{ steps.id.outputs.immutable }}"
-          docker push "${{ steps.id.outputs.rolling }}"
+          for ref in "${{ steps.id.outputs.immutable }}" "${{ steps.id.outputs.rolling }}"; do
+            echo "--> ${REGISTRY}/${ref}"
+            skopeo copy --all \
+              --dest-creds "${DH_USER}:${DH_PASS}" \
+              "docker-daemon:${ref}" "docker://${REGISTRY}/${ref}"
+          done
 
-          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${{ steps.id.outputs.immutable }}" 2>/dev/null || true)"
+          DIGEST="$(skopeo inspect --no-tags --creds "${DH_USER}:${DH_PASS}" \
+            "docker://${REGISTRY}/${{ steps.id.outputs.immutable }}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["Digest"])')"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           {
-            echo "- pushed: \`${{ steps.id.outputs.immutable }}\`"
-            echo "- pushed: \`${{ steps.id.outputs.rolling }}\`"
-            echo "- digest: \`${DIGEST:-unavailable}\`"
+            echo "- docker hub: \`${{ steps.id.outputs.immutable }}\`"
+            echo "- digest: \`${DIGEST}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+        id: dockerhub
+
+      # Mirrored, not rebuilt. Same digest by construction — see the note above.
+      # Skipped rather than failed when QUAY_USERNAME is unset, so a fork without quay credentials
+      # still publishes to Docker Hub instead of going red on a registry it was never given access to.
+      - name: Mirror to Quay
+        if: ${{ (inputs.push == true || github.event_name == 'push') && env.QUAY_USER != '' }}
+        env:
+          QUAY_USER: ${{ secrets.QUAY_USERNAME }}
+          QUAY_PASS: ${{ secrets.QUAY_TOKEN }}
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_PASS: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SRC_IMMUTABLE="${{ steps.id.outputs.immutable }}"
+          SRC_ROLLING="${{ steps.id.outputs.rolling }}"
+          for ref in "${SRC_IMMUTABLE}" "${SRC_ROLLING}"; do
+            dest="${ref/${DOCKERHUB_NAMESPACE}\//${QUAY_NAMESPACE}/}"
+            echo "--> ${QUAY_REGISTRY}/${dest}"
+            skopeo copy --all \
+              --src-creds "${DH_USER}:${DH_PASS}" \
+              --dest-creds "${QUAY_USER}:${QUAY_PASS}" \
+              "docker://${REGISTRY}/${ref}" "docker://${QUAY_REGISTRY}/${dest}"
+          done
+
+          QD="$(skopeo inspect --no-tags --creds "${QUAY_USER}:${QUAY_PASS}" \
+            "docker://${QUAY_REGISTRY}/${SRC_IMMUTABLE/${DOCKERHUB_NAMESPACE}\//${QUAY_NAMESPACE}/}" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["Digest"])')"
+          echo "- quay: \`${QUAY_REGISTRY}/${SRC_IMMUTABLE/${DOCKERHUB_NAMESPACE}\//${QUAY_NAMESPACE}/}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          # The mirror is only useful if it is genuinely the same image. Prove it rather than assume it.
+          if [ "${QD}" != "${{ steps.dockerhub.outputs.digest }}" ]; then
+            echo "::error::digest mismatch — docker hub ${{ steps.dockerhub.outputs.digest }} vs quay ${QD}"
+            exit 1
+          fi
+          echo "digests match: ${QD}"
 
       - name: Not pushed
         if: ${{ inputs.push != true && github.event_name != 'push' }}

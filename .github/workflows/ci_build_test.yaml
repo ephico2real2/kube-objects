@@ -30,7 +30,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo ci_scripts/install_dep.sh
+          ci_scripts/install_dep.sh
 
       - name: Builder
         run: |
@@ -51,9 +51,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # This job previously ran against whatever Ruby the runner happened to ship, while `build` used
+      # setup-ruby — so the tests could pass or fail on a different interpreter than the one that built
+      # the gem, and than the 3.3 in the image we ship.
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
       - name: Install dependencies
         run: |
-          sudo ci_scripts/install_dep.sh
+          ci_scripts/install_dep.sh
 
       - uses: actions/cache@v4
         with:
@@ -206,11 +215,22 @@ jobs:
             --nodes-count $MINIKUBE_NODE_COUNTS\
           	-p no:warnings -s -n auto
   fossa-scan:
+    # FOSSA is Splunk's licence-scanning account and this fork has no FOSSA_API_KEY, so every run
+    # failed with "A FOSSA API key was specified, but it is an empty string". continue-on-error stopped
+    # it failing the workflow but left a permanently red job, and a check that is always red is a check
+    # nobody reads. The steps below are gated on the key being present, so this goes green-by-skipping
+    # until someone sets one.
+    #
+    # The gate is on the STEPS, not the job: `secrets` is not a valid context in a job-level `if:` and
+    # GitHub rejects the entire workflow file with "Unrecognized named-value: 'secrets'".
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: run fossa anlyze and create report
+        if: ${{ env.FOSSA_API_KEY != '' }}
+        env:
+          FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
         run: |
           curl -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/fossas/fossa-cli/master/install-latest.sh | bash
           fossa analyze  --include-unused-deps --debug
@@ -223,6 +243,9 @@ jobs:
           name: THIRDPARTY
           path: /tmp/THIRDPARTY
       - name: run fossa test
+        if: ${{ env.FOSSA_API_KEY != '' }}
+        env:
+          FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
         run: |
           fossa test --debug
         env:
