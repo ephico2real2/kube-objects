@@ -161,15 +161,16 @@ jobs:
           chmod +x minikube
           sudo mv minikube /usr/local/bin/
           # Start Minikube and Wait.
-          # DOCKER RUNTIME, DELIBERATELY — a containerd attempt is REVERTED here, with the story
-          # recorded so nobody retries it: containerd was tried as a fix for the splunk pod's sudo
-          # failure ("PAM account management error"), did NOT fix it (the real fix is the sudoers
-          # drop-in in ci_scripts/k8s-splunk.yml, which is runtime-agnostic), and broke 101 func
-          # tests in one run: container-log tests, because containerd writes CRI-format logs while
-          # this suite's values assume docker json; and the kubelet-stats metrics tests, which are
-          # calibrated against the docker runtime's stats surface. The func-test suite is docker-
-          # runtime-shaped; keep the runtime matching it.
-          minikube start --driver=docker --container-runtime=docker --cpus 2 --memory 4096 --kubernetes-version=${KUBERNETES_VERSION} --no-vtx-check -n=${MINIKUBE_NODE_COUNTS}
+          # CONTAINERD, AND THIS TIME THE FULL STORY IS MEASURED IN BOTH DIRECTIONS. Under the
+          # docker runtime the per-container cAdvisor metrics the tests assert (kube.container.
+          # spec.*, cpu.cfs.*, tasks.state WITH container_name) never reach Splunk on ANY k8s
+          # version tried (52 failures on v1.34.11 and on v1.31.2 alike) — modern kubelet cAdvisor
+          # does not collect docker-runtime containers. Under containerd the same families exist
+          # with per-container dimensions (verified live: mstats BY container_name). containerd's
+          # CRI log format is handled by logFormatType=cri in the chart's ci_scripts/sck_values.yml
+          # — the missing half that made an earlier containerd attempt look broken. The splunk
+          # pod's sudo works on either runtime via the sudoers drop-in in ci_scripts/k8s-splunk.yml.
+          minikube start --driver=docker --container-runtime=containerd --cpus 2 --memory 4096 --kubernetes-version=${KUBERNETES_VERSION} --no-vtx-check -n=${MINIKUBE_NODE_COUNTS}
           export JSONPATH='{range .items[*]}{@.metadata.name}:{range @.status.conditions[*]}{@.type}={@.status};{end}{end}'
           # BOUNDED. `until ...; do sleep 1; done` with no ceiling is how this job hung for 18 minutes
           # with no output and would have run to the 6-hour limit.
