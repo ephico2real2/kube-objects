@@ -55,11 +55,16 @@ spec:
     - name: SPLUNK_LAUNCH_CONF
       value: OPTIMISTIC_ABOUT_FILE_LOCKING=1
     volumeMounts:
+    # A single-FILE mount via subPath, not a directory mount. Mounting the configMap over
+    # /etc/sudoers.d makes kubelet's projected directory world-writable and sudo then refuses the
+    # whole directory ("sudo: /etc/sudoers.d is world writable") before reading any file in it.
+    # With subPath only the file itself is projected; the directory stays the image's own 0750.
     - name: ci-sudoers
-      mountPath: /etc/sudoers.d
+      mountPath: /etc/sudoers.d/00-ci-no-pam-acct
+      subPath: 00-ci-no-pam-acct
       readOnly: true
   volumes:
   - name: ci-sudoers
     configMap:
       name: splunk-ci-sudoers
-      defaultMode: 288  # 0440 — sudoers files must be root-owned and not world-writable
+      defaultMode: 288  # 0440 - sudoers files must be root-owned and not world-writable
