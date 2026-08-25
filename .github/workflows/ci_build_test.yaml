@@ -158,8 +158,15 @@ jobs:
           curl -Lo minikube https://storage.googleapis.com/minikube/releases/${MINIKUBE_VERSION}/minikube-linux-amd64
           chmod +x minikube
           sudo mv minikube /usr/local/bin/
-          # Start Minikube and Wait
-          minikube start --driver=docker --container-runtime=docker --cpus 2 --memory 4096 --kubernetes-version=${KUBERNETES_VERSION} --no-vtx-check -n=${MINIKUBE_NODE_COUNTS}
+          # Start Minikube and Wait.
+          # CONTAINERD, NOT DOCKER, AS THE NODE RUNTIME. With --container-runtime=docker
+          # (docker://29.2.1 inside the node) the non-root splunk pod dies in ansible's very first
+          # task: sudo fails with "PAM account management error: Authentication service cannot
+          # retrieve authentication info" — setuid sudo is not elevating under that runtime. The
+          # identical pod spec runs clean on containerd (verified on kind v0.25.0 with the same
+          # manifest). containerd is also what real clusters run since dockershim's removal in
+          # k8s 1.24, so the func test gets MORE representative, not less.
+          minikube start --driver=docker --container-runtime=containerd --cpus 2 --memory 4096 --kubernetes-version=${KUBERNETES_VERSION} --no-vtx-check -n=${MINIKUBE_NODE_COUNTS}
           export JSONPATH='{range .items[*]}{@.metadata.name}:{range @.status.conditions[*]}{@.type}={@.status};{end}{end}'
           # BOUNDED. `until ...; do sleep 1; done` with no ceiling is how this job hung for 18 minutes
           # with no output and would have run to the 6-hour limit.
