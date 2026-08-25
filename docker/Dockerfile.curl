@@ -1,0 +1,185 @@
+# =============================================================================
+# Dockerfile.curl — THE DEBUG-CAPABLE VARIANT of docker/Dockerfile. Identical in every way except
+# the pack also carries curl (libcurl-minimal), cat and ls for in-pod debugging. Published by the
+# same CI run as the standard image, under the '-curl'-suffixed pass (e.g. 1.3.3-h2-curl). Keep
+# the two files in step: any change to docker/Dockerfile belongs here too.
+# =============================================================================
+# =============================================================================
+# THREE STAGES, AND THE SPLIT IS LOAD-BEARING.
+#
+# The runtime base (hi/ruby:3.4) is a Red Hat Hardened Image with NO SHELL AT ALL — /bin/sh does not
+# exist, so a RUN instruction in the final stage cannot execute in any form. Everything that used to
+# happen there (gem install, bundle install, dnf, mkdir, chown) now happens in builder stages and
+# crosses into the runtime as files, via COPY --from.
+#
+# Two SEPARATE builder stages, not one, because they install different gem trees into the same
+# GEM_HOME (/usr/local/bundle — both hardened images pin it there). gembuild resolves the repo-root
+# Gemfile, which drags in development/test gems that must never ship; appbuild resolves only
+# docker/Gemfile, and its /usr/local/bundle is the one the runtime copies. One shared stage would
+# ship the union.
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# Stage 1 — gembuild: package the plugin source into a .gem, exactly as
+# `bundle exec rake build` has always done. Nothing from this stage ships
+# except the .gem file itself.
+FROM registry.access.redhat.com/hi/ruby:3.4-builder AS gembuild
+
+# The hardened builder's default user is 65532; dnf and writing /app need root. Root never survives
+# into the runtime image — the final stage runs as 65532 (the base's own user).
+USER 0
+
+# NO `dnf update -y` HERE, DELIBERATELY. On the old ubi9 base that line patched packages that
+# SHIPPED (measured: it was worth 129 fixable HIGHs there). On this base nothing a builder-stage dnf
+# touches can reach the runtime — only the gem tree crosses, via COPY --from — so updating builder
+# RPMs changes the shipped artifact by exactly nothing and costs build-time reproducibility. If it is
+# ever reinstated: plain `dnf update -y` FAILS on this builder (measured 2026-08-24 — the repo's best
+# candidate for redhat-rpm-config requires gnome-srpm-macros, which the public hummingbird repo does
+# not provide), so it would need --no-best; and measured the same day, --no-best had nothing to do.
+
+# HEADERS THE LOCKED GEMS COMPILE AGAINST, measured, not guessed. The hardened builder ships gcc and
+# make but not these -devel packages: without openssl-devel the openssl gem (4.0.2, pulled in via
+# fluentd -> async-http -> io-endpoint) dies in extconf with "OpenSSL library could not be found";
+# libffi-devel makes the ffi gem link the system libffi.so.8 — which the hardened RUNTIME ships —
+# instead of statically building its vendored copy. git-core because THIS repo's root Gemfile
+# git-sources kubeclient (github.com/ephico2real2/kubeclient, pinned ref) and the hardened builder
+# ships no git. Builder-only: no package installed here ships.
+RUN dnf install -y git-core openssl-devel libffi-devel && dnf clean all
+
+ADD ./ /app/
+WORKDIR /app
+
+# PIN BUNDLER TO THE 2.x SERIES. The gemspec declares `bundler ~> 2.0`; a bare `gem install bundler`
+# now fetches 4.x, and once that is first on PATH the resolve fails blaming the Gemfile. Same
+# rationale, at more length, in ci_scripts/relock.sh.
+RUN gem install bundler -v '~> 2.0' --no-document
+RUN bundle update --bundler
+RUN bundle install
+RUN bundle exec rake build -t -v
+
+# ----------------------------------------------------------------------------
+# Stage 2 — appbuild: assemble every file the runtime will contain, at the
+# exact paths the runtime will use. /usr/local/bundle here IS the runtime gem
+# tree; /fluentd here IS the runtime app directory.
+FROM registry.access.redhat.com/hi/ruby:3.4-builder AS appbuild
+
+USER 0
+
+# The hardened builder ships NO git, and docker/Gemfile sources kubeclient from a git repository
+# (github.com/ephico2real2/kubeclient, pinned to a ref), so `bundle install` below needs a git
+# binary. openssl-devel and libffi-devel for the same measured reasons as in gembuild — this stage
+# compiles the tree that actually ships. Builder-only: nothing dnf installs here can reach the
+# runtime, because only /usr/local/bundle and /fluentd are copied out.
+RUN dnf install -y git-core openssl-devel libffi-devel && dnf clean all
+
+COPY docker/Gemfile docker/Gemfile.lock /fluentd/
+COPY --from=gembuild /app/pkg/fluent-plugin-*.gem /tmp/
+
+WORKDIR /fluentd
+
+# GEM_HOME IS ALREADY CORRECT, AND THAT IS THE POINT OF THIS BASE PAIR. Both hardened images set
+# GEM_HOME=/usr/local/bundle and BUNDLE_APP_CONFIG=/usr/local/bundle with BUNDLE_PATH unset, so the
+# tree `bundle install` writes here is found by the runtime with no ENV wrangling. On ubi9 that
+# alignment had to be built by hand, and getting it wrong shipped an image that scanned clean and
+# could not boot ("bundler: command not found: fluentd" — the gems existed, just not where the
+# runtime user looked).
+#
+# ESSENTIAL STEPS, IN THEIR OWN RUN, WITH NO `|| true`. An earlier &&-chain ending in `|| true`
+# short-circuited before `bundle install` and reported success — an image with no application in it,
+# which no vulnerability scan can see. If any step here fails, the build fails.
+RUN gem install bundler -v '~> 2.0' --no-document \
+ && gem unpack /tmp/*.gem --target gem \
+ && bundle install \
+ && rm -f /tmp/*.gem
+
+# PROVE THE GEM TREE CAN RUN, AT BUILD TIME. This exercises the same resolution path the runtime CMD
+# uses (same GEM_HOME, same Gemfile, same cwd), so a broken install fails the build instead of
+# shipping. The runtime image repeats this proof from the outside — docker run <image> — because this
+# stage's ruby is the builder's, not the runtime's.
+RUN bundle exec fluentd --version
+
+# The runtime cannot mkdir or chmod, so the writable directories the chart expects are created here
+# and copied across. g+rwX because the runtime user is uid 65532 gid 0 — group-0 write also keeps
+# OpenShift-style arbitrary-uid execution working. Ownership is stamped at COPY time in the runtime
+# stage (--chown), not here.
+RUN mkdir -p /fluentd/log /fluentd/etc /fluentd/plugins \
+ && chmod -R g+rwX /fluentd
+
+# JQ PACK (feat/jq-capable branch). Assembles the minimal file set that makes the runtime able to
+# execute the chart's jq_transformer filters and users' raw-jq customFilters: fluent-plugin-jq
+# launches the external jq BINARY through a SHELL (IO.popen "jq ... 2>&1"), so it needs both
+# /bin/sh and jq. Contents measured with ldd, not guessed: jq + libjq.so.1 + libonig.so.5, and
+# bash + libtinfo.so.6 with an sh -> bash symlink (cp -L dereferences the library symlinks; the
+# sh symlink itself survives the directory COPY below).
+# THE CURL VARIANT'S EXTRA PACK, measured like everything else. cat and ls in this base are shims
+# into one coreutils multicall binary ("#!/usr/bin/coreutils --coreutils-prog-shebang=cat"), so
+# that binary ships too (shims copied WITHOUT -L to stay shims); its only runtime-absent library
+# is the trimmed libsystemd. curl rides libcurl-MINIMAL, swapped in deliberately: full libcurl
+# drags ~26 extra libraries (LDAP, libssh, HTTP/3, brotli, sasl, fido2...), the minimal build
+# needs the ten below, mostly the kerberos family. Every library is here because ldd named it and
+# the runtime lacks it. Measured effect vs the standard h2 image: +8 MB, ZERO additional trivy
+# findings. Both tools prove themselves before the stage ends.
+RUN dnf swap -y libcurl libcurl-minimal \
+ && dnf install -y jq && dnf clean all \
+ && mkdir -p /jqpack/bin /jqpack/lib64 \
+ && cp -L /usr/bin/jq /usr/bin/bash /usr/bin/curl /usr/bin/coreutils /jqpack/bin/ \
+ && cp /usr/bin/cat /usr/bin/ls /jqpack/bin/ \
+ && ln -s bash /jqpack/bin/sh \
+ && cp -L /usr/lib64/libjq.so.1 /usr/lib64/libonig.so.5 /usr/lib64/libtinfo.so.6 \
+          /usr/lib64/libcurl.so.4 /usr/lib64/libnghttp2.so.14 /usr/lib64/libidn2.so.0 \
+          /usr/lib64/libunistring.so.5 /usr/lib64/libgssapi_krb5.so.2 /usr/lib64/libkrb5.so.3 \
+          /usr/lib64/libk5crypto.so.3 /usr/lib64/libcom_err.so.2 /usr/lib64/libkrb5support.so.0 \
+          /usr/lib64/libkeyutils.so.1 /usr/lib64/libsystemd.so.0 /jqpack/lib64/ \
+ && /jqpack/bin/jq --version && /jqpack/bin/curl --version >/dev/null && echo "curl pack OK"
+
+# ----------------------------------------------------------------------------
+# Stage 3 — runtime. NO SHELL EXISTS IN THIS IMAGE: no RUN can appear below,
+# only metadata and COPY. The base already runs as uid 65532 (gid 0), sets
+# GEM_HOME=/usr/local/bundle, and puts /usr/local/bundle/bin first on PATH.
+FROM registry.access.redhat.com/hi/ruby:3.4
+
+ARG VERSION
+
+LABEL name="Splunk Connect for Kubernetes Objects container" \
+      maintainer="DataEdge@splunk.com" \
+      vendor="Splunk Inc." \
+      version=${VERSION} \
+      release=${VERSION} \
+      summary="Splunk Connect for Kubernetes Objects container" \
+      description="Splunk Connect for Kubernetes Objects container"
+
+ENV VERSION=${VERSION}
+
+COPY LICENSE /licenses/LICENSE
+
+# The whole gem tree, installed by appbuild into the exact GEM_HOME this base declares. --chown to
+# the runtime identity rather than trusting source-stage ownership — uid 65532 has no passwd entry,
+# so it is written numerically.
+COPY --from=appbuild --chown=65532:0 /usr/local/bundle /usr/local/bundle
+
+# Gemfile + Gemfile.lock + the unpacked plugin (gem/) + the log/etc/plugins directories the chart
+# mounts into and writes under, pre-created and group-writable because there is no mkdir here.
+COPY --from=appbuild --chown=65532:0 /fluentd /fluentd
+
+# JQ-CAPABLE VARIANT — a deliberate, mandated deviation from the shell-less default, for users
+# whose customFilters need raw jq: this restores /bin/sh (bash) and jq to the runtime. The cost is
+# real — a shell returns to the attack surface — and accepted for this variant only; the default
+# images on develop stay shell-less. /bin is a symlink to /usr/bin in this base, so the COPY lands
+# the binaries on PATH and /bin/sh resolves through the symlink.
+COPY --from=appbuild /jqpack/bin/ /bin/
+COPY --from=appbuild /jqpack/lib64/ /usr/lib64/
+
+# Belt and braces: WORKDIR alone would let bundler find the Gemfile by cwd, but a pod spec that
+# overrides workingDir would silently break that. The explicit path cannot be broken by cwd.
+ENV BUNDLE_GEMFILE=/fluentd/Gemfile
+WORKDIR /fluentd
+
+# The base already defaults to 65532; restated so the security posture is declared in THIS file and
+# survives a base-image change.
+USER 65532
+
+# EXEC FORM, NOT SHELL FORM — doubly mandatory now. With `CMD bundle exec ...` docker would run
+# /bin/sh -c, and this image HAS no /bin/sh, so the container could not start at all. It was already
+# the right form before that: exec form makes fluentd PID 1, so a Kubernetes SIGTERM on pod deletion
+# reaches fluentd directly and in-flight events are flushed instead of lost to the kubelet's SIGKILL.
+CMD ["bundle", "exec", "fluentd", "-c", "/fluentd/etc/fluent.conf"]

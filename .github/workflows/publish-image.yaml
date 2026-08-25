@@ -64,6 +64,20 @@ env:
 jobs:
   build-scan-publish:
     runs-on: ubuntu-latest
+    # TWO IMAGES PER RUN, one per Dockerfile. 'standard' is docker/Dockerfile (jq pack only);
+    # 'curl' is docker/Dockerfile.curl (jq pack + curl/cat/ls debug tools) and publishes under the
+    # '-curl'-suffixed pass (e.g. 1.3.3-h2-curl). fail-fast off so one variant's failure still
+    # yields the other's scan evidence.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: standard
+            dockerfile: ./docker/Dockerfile
+            pass_suffix: ''
+          - variant: curl
+            dockerfile: ./docker/Dockerfile.curl
+            pass_suffix: '-curl'
     permissions:
       contents: read
       # Lets the SARIF step publish findings to the repo's Security tab. Least-privilege: the job gets
@@ -95,6 +109,8 @@ jobs:
           else
             PASS="${{ inputs.hardening_pass }}"
           fi
+          # The variant rides the pass name: standard keeps it bare, curl appends '-curl'.
+          PASS="${PASS}${{ matrix.pass_suffix }}"
 
           # A VERSION file that does not match the chart's declared tag means the chart would pull
           # something this build never produced. Cheap to check, expensive to miss.
@@ -146,7 +162,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ./docker/Dockerfile
+          file: ${{ matrix.dockerfile }}
           platforms: ${{ env.PLATFORM }}
           push: false
           load: true
@@ -155,8 +171,8 @@ jobs:
             ${{ steps.id.outputs.rolling }}
           build-args: |
             VERSION=${{ steps.id.outputs.build_version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
 
       # THE WHOLE POINT OF THIS FORK IS CVE REDUCTION, so publishing without scanning would be
       # self-defeating. The gate is on FIXABLE findings (`--ignore-unfixed`) because that is the only
@@ -199,7 +215,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: trivy-${{ steps.id.outputs.image }}-${{ steps.id.outputs.version }}
+          name: trivy-${{ steps.id.outputs.image }}-${{ steps.id.outputs.version }}-${{ matrix.variant }}
           path: trivy-report.json
           if-no-files-found: warn
 
@@ -241,7 +257,7 @@ jobs:
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
-          category: trivy-image
+          category: trivy-image-${{ matrix.variant }}
 
       # SKOPEO, NOT `docker push`, AND THE CREDENTIALS ARRIVE LAST.
       #
