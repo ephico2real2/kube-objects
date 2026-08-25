@@ -1,0 +1,240 @@
+# Build the plugin image and publish it to Docker Hub.
+#
+# CANONICAL COPY. This file is installed into all four forks at
+# .github/workflows/publish-image.yaml — it is identical in each, because the four repos share one
+# Dockerfile shape and one VERSION-file convention. Edit it here and re-install; do not let the four
+# copies drift.
+#
+# THERE WAS NO UPSTREAM EQUIVALENT. splunk's ci_build_test.yaml builds with `push: false` and runs only
+# on pull_request, so it never published anything — whatever pushed the old splunk/* images was internal
+# and is not in the repo. This workflow is new, not a port, which is also why it does not inherit
+# upstream's retired runners (ubuntu-20.04), deprecated actions (checkout@v2, cache@v1) or the
+# `::set-output` syntax GitHub removed.
+#
+# WHY MANUAL BY DEFAULT. These four images carry production telemetry to Splunk. Publishing on every push
+# would let an unreviewed commit reach a cluster that pulls a rolling tag. Releases here are deliberate
+# acts, so the trigger is workflow_dispatch plus an explicit `image-v*` tag.
+
+name: Publish image
+
+on:
+  workflow_dispatch:
+    inputs:
+      hardening_pass:
+        description: 'Hardening pass number — bump when re-hardening the same upstream version (h1, h2, ...)'
+        required: true
+        default: 'h1'
+      push:
+        description: 'Actually push to Docker Hub. Leave false to build and scan only.'
+        type: boolean
+        required: true
+        default: false
+      fail_on_critical:
+        description: 'Refuse to push if trivy finds a fixable CRITICAL or HIGH.'
+        type: boolean
+        required: true
+        default: true
+
+  push:
+    tags:
+      - 'image-v*'
+
+env:
+  # Docker Hub account is ephico2real. GitHub is ephico2real2. One letter apart — the wrong one here
+  # produces a plausible-looking reference that fails only at pull time, on a cluster.
+  REGISTRY: docker.io
+  DOCKERHUB_NAMESPACE: ephico2real
+  PLATFORM: linux/amd64
+
+jobs:
+  build-scan-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Lets the SARIF step publish findings to the repo's Security tab. Least-privilege: the job gets
+      # no write access to code, packages or anything else.
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The image name matches the repository name for all four (fluentd-hec, kube-objects, k8s-metrics,
+      # k8s-metrics-aggr), so one workflow serves every repo without per-repo configuration.
+      #
+      # VERSION is a file in the repo root and is the upstream release this fork descends from. The sha is
+      # the commit actually being built. Both go in the tag: the version says what it forked from, the sha
+      # says exactly which source produced these bytes. See splunk-sck-hardening/IMAGES.md §4.
+      - name: Compute identity
+        id: id
+        run: |
+          set -euo pipefail
+          IMAGE="${GITHUB_REPOSITORY##*/}"
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          SHA="$(git rev-parse --short=7 HEAD)"
+
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            # Tag form: image-v1.3.3-h2 -> pass h2. Falls back to h1 if the tag omits it.
+            PASS="$(printf '%s' "${GITHUB_REF_NAME}" | sed -n 's/.*-\(h[0-9][0-9]*\)$/\1/p')"
+            PASS="${PASS:-h1}"
+          else
+            PASS="${{ inputs.hardening_pass }}"
+          fi
+
+          # A VERSION file that does not match the chart's declared tag means the chart would pull
+          # something this build never produced. Cheap to check, expensive to miss.
+          case "$VERSION" in
+            "") echo "::error::VERSION file is empty"; exit 1 ;;
+          esac
+
+          # THE SCAN GATE IS COMPUTED HERE, NOT INLINE IN THE STEP, because the obvious inline form is
+          # wrong in a way that fails open. `${{ (inputs.fail_on_critical == false) && '0' || '1' }}`
+          # looks right, but on a TAG PUSH there are no inputs: `inputs.fail_on_critical` is null, and
+          # GitHub coerces null and false to the same value, so the comparison is TRUE and the gate
+          # resolves to exit-code 0 — disabled on exactly the real releases it exists to protect.
+          # Defaulting to enabled, and only disabling on an explicit manual opt-out, fails closed.
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${{ inputs.fail_on_critical }}" = "false" ]; then
+            GATE=0
+          else
+            GATE=1
+          fi
+
+          REPO="${{ env.DOCKERHUB_NAMESPACE }}/${IMAGE}"
+          {
+            echo "image=${IMAGE}"
+            echo "version=${VERSION}"
+            echo "pass=${PASS}"
+            echo "immutable=${REPO}:${VERSION}-${PASS}-g${SHA}"
+            echo "rolling=${REPO}:${VERSION}-${PASS}"
+            echo "build_version=${VERSION}-${PASS}-g${SHA}"
+            echo "gate=${GATE}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "### \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- immutable: \`${REPO}:${VERSION}-${PASS}-g${SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- rolling:   \`${REPO}:${VERSION}-${PASS}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # BUILD FIRST, PUSH LATER — the two are deliberately separate steps.
+      #
+      # `load: true` puts the image in the runner's local docker so trivy can scan the exact artifact that
+      # would be published. Building straight to the registry would mean scanning something already
+      # public, which defeats the gate below. Single-platform only, which is why load works here; a
+      # multi-arch build cannot be loaded and would need a different shape.
+      #
+      # build-arg VERSION is not cosmetic: the Dockerfile stamps it into the `version` and `release`
+      # LABELs and into ENV VERSION, so `docker inspect` on a running container reports the same identity
+      # as its tag. Without it the labels say "null" and a running pod cannot be traced back to a build.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          push: false
+          load: true
+          tags: |
+            ${{ steps.id.outputs.immutable }}
+            ${{ steps.id.outputs.rolling }}
+          build-args: |
+            VERSION=${{ steps.id.outputs.build_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # THE WHOLE POINT OF THIS FORK IS CVE REDUCTION, so publishing without scanning would be
+      # self-defeating. The gate is on FIXABLE findings (`--ignore-unfixed`) because that is the only
+      # thing a rebuild can act on: the UBI base carries thousands of findings with no upstream fix, and
+      # failing on those would mean the workflow could never pass, which trains everyone to disable it.
+      - name: Scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.id.outputs.immutable }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: ${{ steps.id.outputs.gate }}
+          scanners: vuln
+
+      # Runs even when the gate above failed, so a failed run still tells you WHAT it found rather than
+      # only that it failed. Uploaded as an artifact because the table in the log scrolls away.
+      - name: Scan report (always)
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.id.outputs.immutable }}
+          format: json
+          output: trivy-report.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          scanners: vuln
+          exit-code: '0'
+
+      - name: Upload scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-${{ steps.id.outputs.image }}-${{ steps.id.outputs.version }}
+          path: trivy-report.json
+          if-no-files-found: warn
+
+      # SARIF goes to the repository's Security tab, which is the difference between a finding someone
+      # has to go digging in a log for and one that is visible, deduplicated across runs, and shows when
+      # it first appeared and when it was fixed. That history is the whole point of maintaining a fork:
+      # without it we cannot tell a NEW regression from a CVE we already knew about and accepted.
+      #
+      # UNFIXED FINDINGS ARE INCLUDED HERE, deliberately, unlike the push gate above. The gate must only
+      # block on things a rebuild can act on, or it would be unpassable. The Security tab has the
+      # opposite job: record everything, so an unfixable finding that LATER gets a fix is visible the
+      # next time this runs rather than silently missed.
+      - name: Scan (SARIF for the Security tab)
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.id.outputs.immutable }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          scanners: vuln
+          exit-code: '0'
+
+      - name: Publish SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-image
+
+      # Login happens LAST-MINUTE, after the scan has passed. Credentials are never in the environment
+      # during the build, so a malicious or compromised dependency in the image build cannot read them.
+      #
+      # DOCKERHUB_TOKEN must be a Docker Hub ACCESS TOKEN, not the account password: it is scoped, it is
+      # revocable without changing the password, and it does not unlock the Hub web account.
+      - name: Log in to Docker Hub
+        if: ${{ inputs.push == true || github.event_name == 'push' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Both tags are the same digest — the immutable one is what a cluster pins, the rolling one is for
+      # humans. There is deliberately NO `latest`: a moving latest on a telemetry image is how a cluster
+      # silently changes behaviour on a pod reschedule.
+      - name: Push
+        if: ${{ inputs.push == true || github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          docker push "${{ steps.id.outputs.immutable }}"
+          docker push "${{ steps.id.outputs.rolling }}"
+
+          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${{ steps.id.outputs.immutable }}" 2>/dev/null || true)"
+          {
+            echo "- pushed: \`${{ steps.id.outputs.immutable }}\`"
+            echo "- pushed: \`${{ steps.id.outputs.rolling }}\`"
+            echo "- digest: \`${DIGEST:-unavailable}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Not pushed
+        if: ${{ inputs.push != true && github.event_name != 'push' }}
+        run: echo "::notice::Built and scanned only. Re-run with push=true to publish."
