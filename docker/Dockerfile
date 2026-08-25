@@ -113,9 +113,11 @@ RUN dnf install -y jq && dnf clean all \
  && /jqpack/bin/jq --version
 
 # ----------------------------------------------------------------------------
-# Stage 3 — runtime. NO SHELL EXISTS IN THIS IMAGE: no RUN can appear below,
-# only metadata and COPY. The base already runs as uid 65532 (gid 0), sets
-# GEM_HOME=/usr/local/bundle, and puts /usr/local/bundle/bin first on PATH.
+# Stage 3 — runtime. NO SHELL EXISTS IN THIS IMAGE: shell-form RUN is
+# impossible below — only metadata, COPY, and (sparingly) EXEC-FORM RUN,
+# which needs no shell and is used once for the measured base-file removal.
+# The base already runs as uid 65532 (gid 0), sets GEM_HOME=/usr/local/bundle,
+# and puts /usr/local/bundle/bin first on PATH.
 FROM registry.access.redhat.com/hi/ruby:3.4
 
 ARG VERSION
