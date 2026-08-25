@@ -23,6 +23,12 @@ spec:
     env:
     - name: SPLUNK_START_ARGS
       value: --accept-license
+    # Newer splunk/splunk images refuse to start on --accept-license alone: the entrypoint also
+    # demands acceptance of the Splunk General Terms, and without it the pod crashloops printing
+    # "License not accepted, please adjust SPLUNK_GENERAL_TERMS and/or SPLUNK_START_ARGS". This is
+    # the exact flag the container's own error message prescribes; older images ignore it.
+    - name: SPLUNK_GENERAL_TERMS
+      value: --accept-sgt-current-at-splunk-com
     - name: SPLUNK_USER
       value: root
     - name: SPLUNK_PASSWORD
