@@ -1,3 +1,21 @@
+# CI-ONLY SUDOERS DROP-IN — the diagnosis is measured, not guessed. On GitHub runners (minikube,
+# BOTH docker and containerd runtimes) sudo inside this image fails its PAM account phase: strace
+# shows the privilege-dropped child that hardened pam_unix forks getting EACCES opening the
+# mode-000 /etc/shadow, and pam returns "Authentication service cannot retrieve authentication
+# info" (PAM_AUTHINFO_UNAVAIL) — ansible's first task dies and the pod crashloops. The identical
+# pod spec, same image DIGEST, provisions cleanly on kind and in plain docker; only this
+# environment's fallback path fails. `Defaults !pam_acct_mgmt` skips exactly the failing PAM call;
+# sudoers policy itself (who may sudo, NOPASSWD) still applies. The image's /etc/sudoers.d is
+# empty (verified in both environments), so mounting over it loses nothing. The filename carries
+# no dot: sudoers.d silently ignores entries containing '.'.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: splunk-ci-sudoers
+data:
+  00-ci-no-pam-acct: |
+    Defaults !pam_acct_mgmt
+---
 apiVersion: v1
 kind: Pod
 metadata:
@@ -36,3 +54,12 @@ spec:
       value: changeme2
     - name: SPLUNK_LAUNCH_CONF
       value: OPTIMISTIC_ABOUT_FILE_LOCKING=1
+    volumeMounts:
+    - name: ci-sudoers
+      mountPath: /etc/sudoers.d
+      readOnly: true
+  volumes:
+  - name: ci-sudoers
+    configMap:
+      name: splunk-ci-sudoers
+      defaultMode: 288  # 0440 — sudoers files must be root-owned and not world-writable
