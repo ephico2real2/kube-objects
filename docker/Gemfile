@@ -7,7 +7,7 @@ gem "fluentd", ">= 1.15"
 gem "fluent-plugin-prometheus", ">= 2.0"
 gem "fluent-plugin-record-modifier", "= 2.1.0"
 gem "fluent-plugin-jq", "= 0.5.1"
-gem "oj", "= 3.10.18"
+gem "oj", "~> 3.17"
 gem 'multi_json', '~> 1.14'
 gem 'bigdecimal', '>= 2.0.0'
 gem 'kubeclient', git: 'https://github.com/ephico2real2/kubeclient.git', ref: '451bff9900258cf380d9f349f48b42e9b72aa558'

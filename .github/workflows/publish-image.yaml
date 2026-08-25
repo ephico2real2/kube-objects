@@ -156,6 +156,11 @@ jobs:
       - name: Scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          # The action pins the trivy BINARY, and its default is stale (v0.70.0 for action
+          # v0.36.0). An old scanner misses recently-published advisories, so a green gate can
+          # mean 'nothing found' or 'nothing looked for'. Pin it explicitly and bump it
+          # deliberately; keep it in step with the trivy used locally.
+          version: v0.74.0
           image-ref: ${{ steps.id.outputs.immutable }}
           format: table
           severity: CRITICAL,HIGH
@@ -169,6 +174,11 @@ jobs:
         if: always()
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          # The action pins the trivy BINARY, and its default is stale (v0.70.0 for action
+          # v0.36.0). An old scanner misses recently-published advisories, so a green gate can
+          # mean 'nothing found' or 'nothing looked for'. Pin it explicitly and bump it
+          # deliberately; keep it in step with the trivy used locally.
+          version: v0.74.0
           image-ref: ${{ steps.id.outputs.immutable }}
           format: json
           output: trivy-report.json
@@ -205,6 +215,11 @@ jobs:
         if: always()
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          # The action pins the trivy BINARY, and its default is stale (v0.70.0 for action
+          # v0.36.0). An old scanner misses recently-published advisories, so a green gate can
+          # mean 'nothing found' or 'nothing looked for'. Pin it explicitly and bump it
+          # deliberately; keep it in step with the trivy used locally.
+          version: v0.74.0
           image-ref: ${{ steps.id.outputs.immutable }}
           format: sarif
           output: trivy-results.sarif

@@ -124,9 +124,17 @@ fi
     #
     # Updating the root lock first keeps the pair consistent. Guarded on the file existing, because
     # not every repo here checks a root Gemfile.lock in.
+    # NOT EVERY GEM IS IN BOTH FILES. docker/Gemfile declares gems the root Gemfile never mentions —
+    # `oj` is one — and `bundle lock --update=oj` at the root then dies with "Could not find gem oj",
+    # taking the whole script down under `set -e` before the docker/ resolve is even attempted. Only
+    # update at the root what the root actually knows about; the docker/ stage handles the rest.
     if [ -n "${GEMS}" ] && [ -f Gemfile.lock ]; then
       for g in ${GEMS}; do
-        bundle lock --update="${g}" >/dev/null 2>&1 || bundle lock --update="${g}"
+        if grep -qE "^\s{4}${g} \(" Gemfile.lock; then
+          bundle lock --update="${g}"
+        else
+          echo "    (${g} not in the root Gemfile — updating it in docker/ only)"
+        fi
       done
     fi
     bundle install --quiet
