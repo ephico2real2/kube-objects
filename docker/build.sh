@@ -22,7 +22,7 @@ cd "$(dirname "$0")/.."
 
 VERSION="$(tr -d '[:space:]' < VERSION)"
 SHA="$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)"
-TAG="${1:-${VERSION}-h3-g${SHA}}"  # default pass tracks the current hardening pass of this repo
+TAG="${1:-${VERSION}-h4-g${SHA}}"  # default pass tracks the current hardening pass of this repo
 IMAGE="ephico2real/kube-objects"
 
 # --build-arg VERSION is stamped into the version/release LABELs and ENV VERSION, so a running

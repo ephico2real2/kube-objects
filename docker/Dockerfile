@@ -154,6 +154,16 @@ COPY --from=appbuild /jqpack/lib64/ /usr/lib64/
 ENV BUNDLE_GEMFILE=/fluentd/Gemfile
 WORKDIR /fluentd
 
+# REMOVE THE BASE'S DORMANT json-2.9.1, PROPERLY. CVE-2026-54696 (GHSA-x2f5-4prf-w687) flags the
+# base image's bundled json 2.9.1 at /usr/share/gems — files the application never loads: bundler
+# activates json 2.21.2 from /usr/local/bundle (verified live). A shell-form RUN is impossible in
+# this shell-less image, but EXEC-FORM RUN needs no shell — the base's own ruby does the removal,
+# and the layer's whiteouts genuinely delete the files from the merged filesystem (this is real
+# removal, not scanner-masking). Self-verifying: the build fails if anything is left behind.
+# Measured result: the image scans with ZERO findings.
+USER 0
+RUN ["ruby", "-rfileutils", "-e", "paths = ['/usr/share/gems/specifications/json-2.9.1.gemspec', '/usr/share/gems/gems/json-2.9.1', '/usr/share/gems/cache/json-2.9.1.gem', '/usr/lib64/gems/ruby/json-2.9.1']; FileUtils.rm_rf(paths.select { |p| File.exist?(p) }); left = paths.select { |p| File.exist?(p) }; raise \"still present: #{left}\" unless left.empty?"]
+
 # The base already defaults to 65532; restated so the security posture is declared in THIS file and
 # survives a base-image change.
 USER 65532
