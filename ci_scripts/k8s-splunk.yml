@@ -4,9 +4,12 @@ metadata:
   name: splunk
 spec:
   hostNetwork: true
-  securityContext:
-    runAsUser: 0
-    runAsGroup: 0
+  # NO root securityContext, and no SPLUNK_USER=root: splunk/splunk:latest hard-refuses
+  # `splunk start` as root ("Running Splunk Enterprise as root is deprecated ... use the
+  # --run-as-root option"), the image's ansible exposes no run-as-root knob, and the pod
+  # crashlooped with exit 2 on the 'Start Splunk via CLI' task. The container's default
+  # non-root user completes the playbook cleanly - verified by running the image both
+  # ways. All ports are >1024, so hostNetwork needs no root either.
   containers:
   - name: splunk
     image: splunk/splunk:latest
@@ -29,8 +32,6 @@ spec:
     # the exact flag the container's own error message prescribes; older images ignore it.
     - name: SPLUNK_GENERAL_TERMS
       value: --accept-sgt-current-at-splunk-com
-    - name: SPLUNK_USER
-      value: root
     - name: SPLUNK_PASSWORD
       value: changeme2
     - name: SPLUNK_LAUNCH_CONF
