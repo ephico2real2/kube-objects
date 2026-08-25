@@ -93,12 +93,14 @@ jobs:
       CI_INDEX_OBJECTS: ci_objects
       CI_INDEX_METRICS: ci_metrics
       # minikube v1.38.1 refuses anything below v1.28.0 ("Exiting due to K8S_OLD_UNSUPPORTED",
-      # exit 106), so upstream's v1.23.2 can no longer start at all. v1.34 is the newest
-      # upstream-supported minor that is still at or below minikube's newest-TESTED version
-      # (v1.35.1) — no floor error, no "newer than newest supported" warning, and no --force,
-      # which would poison exactly the signal this test exists to produce. This variable also
-      # pins the kubectl download below.
-      KUBERNETES_VERSION: v1.34.11
+      # exit 106), so upstream's v1.23.2 can no longer start at all. v1.31, NOT NEWER, and the
+      # choice is measured: the metrics func tests assert per-container cAdvisor telemetry
+      # (kube.container.spec.*, cpu.cfs.*, tasks.state) WITH a container_name dimension, which a
+      # v1.31 kubelet still exposes (verified against a live cluster via mstats BY container_name)
+      # and a v1.34 kubelet no longer does — 52 tests fail on v1.34 with "Splunk did not received
+      # any metric ... with field container_name". v1.31 sits inside minikube's window (floor
+      # v1.28, newest tested v1.35.1): no floor error, no --force. Also pins the kubectl download.
+      KUBERNETES_VERSION: v1.31.2
       # Pinned, not `latest`: a new minikube release can move the supported-Kubernetes floor
       # (exactly how v1.23.2 died), turning this job red with nothing in the repo changed.
       # These two versions are a pair — bump them together, keeping KUBERNETES_VERSION inside
